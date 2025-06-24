@@ -3,7 +3,7 @@ import os
 
 # Get the absolute path to the data file
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-data_path = os.path.join(project_root, 'prompt-injection', 'data', 'synthetic_healthcare_data.csv')
+data_path = '/Users/Dell/Desktop/AI_Safety_Vulnerabilities_Demo/prompt_injection/data/synthetic_healthcare_data.csv'
 
 df = pd.read_csv(data_path)
 

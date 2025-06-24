@@ -1,132 +1,146 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import os
-import re
-from datetime import datetime
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 
-# Load data
+st.title("PGD (Projected Gradient Descent) Adversarial Attack Demo")
+
+# Load and preprocess data
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-data_path = os.path.join(project_root, 'prompt-injection', 'data', 'synthetic_healthcare_data.csv')
+data_path = os.path.join(project_root, 'prompt_injection', 'data', 'synthetic_healthcare_data.csv')
 df = pd.read_csv(data_path)
 
-# Detection logic
-def detect_prompt_injection(user_input):
-    suspicious_keywords = [
-        "ignore previous instructions", "disregard above", "pretend to be",
-        "list all", "show all", "patient", "diagnosed", "diagnosis",
-        "medication", "allergies", "doctor", "visit date", "notes",
-        "give me", "extract", "reveal", "leak"
-    ]
-    suspicious_patterns = [
-        r"ignore.*instructions", r"list.*patients?", r"show.*diagnos",
-        r"give me.*data", r"reveal.*information", r"patient.*diagnosed",
-        r"extract.*names?", r"leak.*data"
-    ]
-    flagged = []
-    for keyword in suspicious_keywords:
-        if keyword in user_input.lower():
-            flagged.append(keyword)
-    for pattern in suspicious_patterns:
-        if re.search(pattern, user_input.lower()):
-            flagged.append(pattern)
-    return flagged
+X = df.drop('Diagnosis', axis=1)
+y = df['Diagnosis']
 
-# Vulnerable assistant logic
-def vulnerable_assistant(user_input):
-    user_input_lower = user_input.lower()
-    if "patient name" in user_input_lower:
-        return df['Name'].head(10).tolist()
-    elif "diagnos" in user_input_lower:
-        return df['Diagnosis'].value_counts().head(5).to_dict()
-    elif "medication" in user_input_lower and "diabetes" in user_input_lower:
-        diabetes_patients = df[df['Diagnosis'].str.lower().str.contains('diabetes')]
-        return diabetes_patients['Medication'].value_counts().head(5).to_dict()
-    elif "ignore previous instructions" in user_input_lower or "export all" in user_input_lower:
-        return df.head(5).to_dict(orient='records')
+# Encode categorical features and target
+for col in X.columns:
+    if X[col].dtype == 'object':
+        X[col] = LabelEncoder().fit_transform(X[col])
+if y.dtype == 'object':
+    y = LabelEncoder().fit_transform(y)
+
+scaler = StandardScaler()
+X = scaler.fit_transform(X)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+y_test_tensor = torch.tensor(y_test, dtype=torch.long)
+
+# Define and train model
+class SimpleNN(nn.Module):
+    def __init__(self, input_dim, num_classes):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, 32)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(32, num_classes)
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.fc2(x)
+        return x
+
+input_dim = X_train.shape[1]
+num_classes = len(np.unique(y))
+model = SimpleNN(input_dim, num_classes)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.01)
+
+X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+y_train_tensor = torch.tensor(y_train, dtype=torch.long)
+for epoch in range(100):
+    optimizer.zero_grad()
+    outputs = model(X_train_tensor)
+    loss = criterion(outputs, y_train_tensor)
+    loss.backward()
+    optimizer.step()
+
+# PGD attack function
+def pgd_attack(model, x, y, epsilon=0.1, alpha=0.01, num_iter=40):
+    x_adv = x.clone().detach()
+    x_adv.requires_grad = True
+    for _ in range(num_iter):
+        output = model(x_adv)
+        loss = criterion(output, torch.tensor([y]))
+        loss.backward()
+        # Take a small step in the direction of the gradient
+        x_adv = x_adv + alpha * x_adv.grad.sign()
+        # Project back into the epsilon-ball of the original input
+        x_adv = torch.min(torch.max(x_adv, x - epsilon), x + epsilon)
+        x_adv = torch.clamp(x_adv, -3, 3)  # adjust clamp as needed for your data
+        x_adv = x_adv.detach()
+        x_adv.requires_grad = True
+    return x_adv
+
+# Add this FGSM attack function
+def fgsm_attack(model, x, y, epsilon=0.1):
+    x_adv = x.clone().detach().requires_grad_(True)
+    output = model(x_adv)
+    loss = criterion(output, torch.tensor([y]))
+    loss.backward()
+    x_adv = x_adv + epsilon * x_adv.grad.sign()
+    x_adv = torch.clamp(x_adv, -3, 3)  # adjust clamp as needed for your data
+    return x_adv
+
+# Streamlit UI for PGD attack
+idx = st.number_input("Select test sample index", min_value=0, max_value=len(X_test_tensor)-1, value=0, step=1)
+epsilon = st.slider("Epsilon (attack strength)", min_value=0.01, max_value=0.5, value=0.1, step=0.01)
+alpha = st.slider("Alpha (step size)", min_value=0.001, max_value=0.1, value=0.01, step=0.001)
+num_iter = st.slider("Number of PGD steps", min_value=1, max_value=100, value=40, step=1)
+
+if st.button("Run PGD & FGSM Attack"):
+    x_orig = X_test_tensor[idx:idx+1]
+    y_true = y_test[idx]
+    with torch.no_grad():
+        output = model(x_orig)
+        orig_pred = torch.argmax(output, dim=1).item()
+
+    # FGSM attack
+    x_fgsm = fgsm_attack(model, x_orig, y_true, epsilon=epsilon)
+    with torch.no_grad():
+        output_fgsm = model(x_fgsm)
+        fgsm_pred = torch.argmax(output_fgsm, dim=1).item()
+
+    # PGD attack
+    x_pgd = pgd_attack(model, x_orig, y_true, epsilon=epsilon, alpha=alpha, num_iter=num_iter)
+    with torch.no_grad():
+        output_pgd = model(x_pgd)
+        pgd_pred = torch.argmax(output_pgd, dim=1).item()
+
+    st.write(f"**Original prediction:** {orig_pred} (True label: {y_true})")
+    st.write(f"**FGSM prediction:** {fgsm_pred}")
+    st.write(f"**PGD prediction:** {pgd_pred}")
+
+    if orig_pred != fgsm_pred:
+        st.success("FGSM attack successful: Model prediction changed!")
     else:
-        return "Sorry, I can't help with that."
+        st.warning("FGSM attack failed: Model prediction did not change.")
 
-def guardrailed_assistant(user_input):
-    sensitive_keywords = [
-        'name', 'diagnosis', 'medication', 'patient', 'ignore previous instructions',
-        'export', 'show all', 'list all', 'record'
-    ]
-    if any(word in user_input.lower() for word in sensitive_keywords):
-        return "Access denied: This request may expose sensitive patient information. If you need access, please contact compliance."
-    return vulnerable_assistant(user_input)
-
-# Streamlit UI
-if "log" not in st.session_state:
-    st.session_state.log = []
-if "attack_log" not in st.session_state:
-    st.session_state.attack_log = []
-if "bypassed" not in st.session_state:
-    st.session_state.bypassed = False
-
-st.title("AI Safety Vulnerabilities Demo: Prompt Injection")
-st.write("Try to extract sensitive healthcare data from the assistant. Detection and guardrails are shown in real time.")
-
-user_input = st.text_input("Ask the assistant:")
-
-if st.button("Submit") and user_input:
-    response = guardrailed_assistant(user_input)
-    flagged = detect_prompt_injection(user_input)
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_entry = {
-        "Time": timestamp,
-        "Prompt": user_input,
-        "Response": str(response),
-        "Flagged": ", ".join(flagged) if flagged else "",
-        "Blocked": "Yes" if "Access denied" in str(response) else "No"
-    }
-    st.session_state.log.append(log_entry)
-    st.subheader("Assistant Response")
-    st.write(response)
-    if flagged:
-        st.error(f"⚠️  Prompt injection or sensitive data access detected! Flags: {flagged}")
+    if orig_pred != pgd_pred:
+        st.success("PGD attack successful: Model prediction changed!")
     else:
-        st.success("No prompt injection detected.")
+        st.warning("PGD attack failed: Model prediction did not change.")
 
-st.subheader("Audit Trail (Flagged/Blocked Prompts)")
-log_df = pd.DataFrame([entry for entry in st.session_state.log if entry["Flagged"] or entry["Blocked"] == "Yes"])
-st.dataframe(log_df)
+    # Visualization
+    orig_np = x_orig.detach().cpu().numpy().flatten()
+    fgsm_np = x_fgsm.detach().cpu().numpy().flatten()
+    pgd_np = x_pgd.detach().cpu().numpy().flatten()
+    fgsm_perturb = fgsm_np - orig_np
+    pgd_perturb = pgd_np - orig_np
 
-# Optional: Download button for the audit log
-if not log_df.empty:
-    st.download_button(
-        label="Download Audit Log as CSV",
-        data=log_df.to_csv(index=False),
-        file_name="audit_log.csv",
-        mime="text/csv"
-    )
-
-st.title("Interactive Gradient-Based Prompt Injection Attack Demo")
-st.write("Try to bypass the guardrail by refining your prompt. The session will stop if you succeed.")
-
-user_input = st.text_input("Enter your prompt (type 'exit' to stop):")
-
-if st.button("Submit", key="attack_submit") and user_input and not st.session_state.bypassed:
-    response = guardrailed_assistant(user_input)
-    flagged = detect_prompt_injection(user_input)
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_entry = {
-        "Time": timestamp,
-        "Prompt": user_input,
-        "Response": str(response),
-        "Flagged": ", ".join(flagged) if flagged else "",
-        "Blocked": "Yes" if "Access denied" in str(response) else "No"
-    }
-    st.session_state.attack_log.append(log_entry)
-    st.subheader("Assistant Response")
-    st.write(response)
-    if flagged:
-        st.error(f"⚠️  Prompt injection or sensitive data access detected! Flags: {flagged}")
-    else:
-        st.success("No prompt injection detected.")
-    if "Access denied" not in str(response):
-        st.session_state.bypassed = True
-        st.warning("Guardrail bypassed! Demo stopped. Refresh to try again.")
-
-st.subheader("Attack Attempt Log")
-log_df = pd.DataFrame(st.session_state.attack_log)
-st.dataframe(log_df)
+    st.subheader("Adversarial Perturbation Visualization")
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(orig_np, label="Original", marker='o')
+    ax.plot(fgsm_np, label="FGSM", marker='x')
+    ax.plot(pgd_np, label="PGD", marker='^')
+    ax.plot(fgsm_perturb, label="FGSM Perturbation", linestyle='dashed')
+    ax.plot(pgd_perturb, label="PGD Perturbation", linestyle='dashed')
+    ax.set_xlabel("Feature Index")
+    ax.set_ylabel("Value")
+    ax.legend()
+    st.pyplot(fig)
